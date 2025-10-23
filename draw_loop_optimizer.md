@@ -10,18 +10,19 @@ A full-stack TypeScript system that uses Claude with vision capabilities in an i
 
 ### Components
 
-1. **Client** (Vite + React + TypeScript)
+1. **Client** (Vite + Vue 3 + TypeScript)
    - Orchestrates the optimization loop
+   - **Calls Claude API directly** (vision + text generation)
    - Runs p5.js sketches in sandboxed iframe
    - Captures canvas as WebP images
    - Displays history with auto-scroll
    - Provides scoring/tagging interface
 
 2. **Server** (Node + Express + TypeScript)
-   - Calls Claude API (vision + text generation)
+   - **Thin storage layer only**
    - Persists sessions & attempts as JSON files
    - Stores images directly to disk
-   - Exposes simple REST API
+   - Exposes simple REST API (sessions, attempts, images)
    - Serves static image files
 
 3. **Storage** (Local disk - no database)
@@ -35,13 +36,13 @@ A full-stack TypeScript system that uses Claude with vision capabilities in an i
 
 ```
 1. Client starts session → POST /api/sessions
-2. Initial code generation → POST /api/agent/generate {sessionId, objective}
+2. Client calls Claude API → generate initial code
 3. Client runs code in SketchRunner (iframe + p5 instance mode)
 4. Capture canvas → Blob(WebP, q=0.85) → POST /api/images
 5. Persist attempt → POST /api/attempts {sessionId, code, imageUrl, critique}
-6. Improvement → POST /api/agent/improve {sessionId, code, imageUrl, objective}
+6. Client calls Claude API → improve based on image + code
 7. Repeat steps 3-6 until stopped
-8. UI queries last 5 attempts → GET /api/sessions/:id/history?limit=5
+8. UI queries attempts → GET /api/sessions/:id/attempts
 ```
 
 ---
@@ -49,22 +50,23 @@ A full-stack TypeScript system that uses Claude with vision capabilities in an i
 ## Technology Stack
 
 ### Client
-- **Build**: Vite
-- **Framework**: React + TypeScript
+- **Build**: Vite (already set up)
+- **Framework**: Vue 3 + TypeScript (Composition API)
 - **Graphics**: p5.js (instance mode)
+- **AI**: @anthropic-ai/sdk (calls Claude directly from browser)
 - **Sandbox**: iframe with strict CSP
 - **Styling**: Minimal inline CSS
 - **HTTP**: fetch
+- **Config**: API key in git-ignored config file
 
 ### Server
 - **Runtime**: Node 20+
 - **Framework**: Express (minimal setup)
 - **Dependencies**: 
   - express
-  - cors
-  - multer (file uploads)
-  - @anthropic-ai/sdk
+  - cors (for dev: Vite on :5173, Express on :3000)
 - **Storage**: JSON files + images straight to disk
+- **Role**: Thin storage layer (no AI logic)
 
 ### Storage Structure
 ```
@@ -93,18 +95,20 @@ POST /api/sessions
 Body: { objective: string, size?: { w: number, h: number }, settings?: { maxIters?: number } }
 Returns: { session: { id, objective, size, createdAt, active: true } }
 
-POST /api/sessions/:id/stop
-Returns: { ok: true }
+PATCH /api/sessions/:id
+Body: { active: boolean }
+Returns: { session: Session }
 
-GET /api/sessions/:id/history?limit=5
+GET /api/sessions/:id/attempts
 Returns: { attempts: Attempt[] }
 ```
 
 #### Image Upload
 ```typescript
-POST /api/images (multipart)
-Form: { file: Blob, sessionId: string }
-Returns: { imageUrl: string, width: number, height: number, sizeBytes: number }
+POST /api/images?sessionId={sessionId}&attemptId={attemptId}
+Body: Blob (raw binary WebP)
+Content-Type: image/webp
+Returns: { imageUrl: string }
 ```
 
 #### Attempts
@@ -127,17 +131,6 @@ Returns: Attempt
 
 GET /api/attempts/query?sessionId=...&minScore=...&maxScore=...&tags=tag1,tag2
 Returns: { attempts: Attempt[] }
-```
-
-#### Agent (Claude)
-```typescript
-POST /api/agent/generate
-Body: { sessionId: string, objective: string, size?: { w, h }, topKHistory?: number }
-Returns: { code: string, critique: string, model: string, tokens?: { input, output } }
-
-POST /api/agent/improve
-Body: { sessionId: string, code: string, imageUrl: string, objective: string, topKHistory?: number }
-Returns: { code: string, critique: string, model: string, tokens?: { input, output } }
 ```
 
 ### Data Types
@@ -214,24 +207,24 @@ interface Attempt {
 
 ## Client Implementation
 
-### Components
+### Components (Vue 3 Composition API)
 
-#### 1. App
-- Manages session state and loop (running/stopped)
+#### 1. App.vue
+- Manages session state and loop (running/stopped) with `ref()`
 - Inputs: objective, canvas size
 - Buttons: Start, Stop
-- Resumes if active session exists (GET on load)
+- Resumes if active session exists (GET on `onMounted`)
 
-#### 2. HistoryList
+#### 2. HistoryList.vue
 - Displays last 5 attempts
 - Shows: image thumbnail, code (collapsible), critique, metadata
 - Score/tag editor for each attempt
-- Auto-scrolls to new attempts using `ref.scrollIntoView()`
+- Auto-scrolls to new attempts using template ref + `scrollIntoView()`
 
-#### 3. SketchRunner
+#### 3. SketchRunner.vue
 - Runs p5.js code in sandboxed iframe
-- Signals when rendered or errored
-- Returns captured image as Blob
+- Emits `@rendered` or `@error` events
+- Returns captured image as Blob via callback
 
 ### SketchRunner Details (Safe Dynamic Execution)
 
@@ -265,9 +258,9 @@ interface Attempt {
 
 **Capture Flow**:
 1. After two `requestAnimationFrame` ticks following setup/draw
-2. Get `canvas.toDataURL('image/webp', 0.85)`
-3. postMessage to parent `{ type: 'image', dataUrl }`
-4. Parent converts to Blob → uploads to server
+2. Get canvas element and call `canvas.toBlob(callback, 'image/webp', 0.85)`
+3. postMessage Blob to parent `{ type: 'image', blob }` (use Transferable if needed)
+4. Parent uploads Blob directly to server with fetch
 
 **Error Handling**:
 - Surface uncaught errors in UI
@@ -276,24 +269,67 @@ interface Attempt {
 
 ### Loop Orchestration (Client-side)
 
-```javascript
-while (running) {
-  // 1. Get code from Claude
-  const { code, critique } = !history.length 
-    ? await api.agent.generate({ sessionId, objective })
-    : await api.agent.improve({ sessionId, code: lastAttempt.code, imageUrl: lastAttempt.imageUrl, objective });
-  
-  // 2. Run code and capture
-  const imageBlob = await sketchRunner.render(code, { w: 512, h: 512 });
-  
-  // 3. Upload image
-  const { imageUrl } = await api.images.upload(imageBlob, sessionId);
-  
-  // 4. Persist attempt
-  await api.attempts.create({ sessionId, code, imageUrl, critique, metadata });
-  
-  // 5. Backoff to respect rate limits
-  await delay(1500);
+```typescript
+// App.vue (Composition API)
+import { ref, onMounted } from 'vue';
+import Anthropic from '@anthropic-ai/sdk';
+import { config } from './config';
+
+const anthropic = new Anthropic({ 
+  apiKey: config.anthropicKey,
+  dangerouslyAllowBrowser: true // Local use only
+});
+
+const running = ref(false);
+const history = ref<Attempt[]>([]);
+
+async function callClaude(prompt: string, imageUrl?: string) {
+  const messages: any[] = [{
+    role: 'user',
+    content: imageUrl 
+      ? [
+          { type: 'image', source: { type: 'url', url: imageUrl } },
+          { type: 'text', text: prompt }
+        ]
+      : prompt
+  }];
+
+  const response = await anthropic.messages.create({
+    model: 'claude-3-5-sonnet-20241022',
+    max_tokens: 2000,
+    messages
+  });
+
+  return response.content[0].text; // Parse JSON from response
+}
+
+async function runLoop() {
+  while (running.value) {
+    // 1. Call Claude (initial or improvement)
+    const lastAttempt = history.value[history.value.length - 1];
+    const prompt = !lastAttempt
+      ? `Generate p5.js code for: ${objective}`
+      : `Improve this p5.js code based on the rendered image...`;
+    
+    const { code, critique } = await callClaude(
+      prompt, 
+      lastAttempt?.imageUrl
+    );
+    
+    // 2. Run code and capture
+    const imageBlob = await sketchRunner.value.render(code, { w: 512, h: 512 });
+    
+    // 3. Upload image (raw blob)
+    const attemptId = generateId();
+    const { imageUrl } = await uploadImage(imageBlob, sessionId, attemptId);
+    
+    // 4. Persist attempt
+    const attempt = await saveAttempt({ sessionId, code, imageUrl, critique });
+    history.value.push(attempt);
+    
+    // 5. Backoff to respect rate limits
+    await new Promise(resolve => setTimeout(resolve, 1500));
+  }
 }
 ```
 
@@ -309,19 +345,20 @@ while (running) {
 ```typescript
 import express from 'express';
 import cors from 'cors';
-import multer from 'multer';
-import Anthropic from '@anthropic-ai/sdk';
 import fs from 'fs/promises';
 import path from 'path';
 
 const app = express();
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-app.use(cors());
-app.use(express.json());
+app.use(cors()); // Allow requests from Vite dev server
+app.use(express.json()); // For JSON endpoints
+
+// Handle raw binary uploads for images
+app.use('/api/images', express.raw({ type: 'image/webp', limit: '10mb' }));
+
 app.use('/data', express.static('./data')); // Serve images
 
-const upload = multer({ dest: 'temp/' }); // Temp storage, then move to session dir
+app.listen(3000, () => console.log('Server running on :3000'));
 ```
 
 ### Storage Helpers
@@ -357,18 +394,59 @@ async function saveAttempt(sessionId: string, attempt: Attempt) {
 }
 ```
 
-### Claude Integration
+### Client-side Claude Integration
 
-**Keep calls server-side**:
-- Environment variable: `ANTHROPIC_API_KEY`
-- Model: `claude-3-5-sonnet-20241022` or latest vision-capable
-- Use JSON-only responses (parse with robust fallback)
+**Browser calls Claude directly**:
+```typescript
+// src/config.ts (git-ignored or with placeholder)
+export const config = {
+  anthropicKey: import.meta.env.VITE_ANTHROPIC_KEY || 'sk-ant-...',
+  serverUrl: 'http://localhost:3000'
+};
+```
+
+```bash
+# .env (git-ignored)
+VITE_ANTHROPIC_KEY=sk-ant-...
+```
+
+**Benefits**:
+- Faster iteration (no server restart for prompt changes)
+- Simpler server (just storage)
+- All AI logic in one place (client)
 
 ### Image Handling
-1. Accept multipart file or base64 dataURL
-2. Save directly to `./data/sessions/{sessionId}/images/{attemptId}.webp`
-3. Return public URL: `/data/sessions/{sessionId}/images/{attemptId}.webp`
-4. No re-encoding needed (client already sends WebP from canvas)
+```typescript
+// POST /api/images?sessionId=xxx&attemptId=yyy
+app.post('/api/images', async (req, res) => {
+  const { sessionId, attemptId } = req.query;
+  const buffer = req.body; // Already a Buffer from express.raw()
+  
+  const imagePath = path.join('./data/sessions', sessionId, 'images', `${attemptId}.webp`);
+  await fs.mkdir(path.dirname(imagePath), { recursive: true });
+  await fs.writeFile(imagePath, buffer);
+  
+  res.json({ imageUrl: `/data/sessions/${sessionId}/images/${attemptId}.webp` });
+});
+```
+
+**Client-side** (Vue):
+```typescript
+// Get blob from canvas
+canvas.toBlob(async (blob) => {
+  const response = await fetch(
+    `http://localhost:3000/api/images?sessionId=${sessionId}&attemptId=${attemptId}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'image/webp' },
+      body: blob
+    }
+  );
+  const { imageUrl } = await response.json();
+}, 'image/webp', 0.85);
+```
+
+**Simple and efficient**: Raw binary transfer, no encoding/decoding overhead.
 
 ---
 
@@ -493,8 +571,8 @@ STYLE:
 ## Implementation Phases
 
 ### Phase 1: Core Loop (1-2 days)
-- ✓ Simple Express server with JSON file storage
-- ✓ Agent generate/improve endpoints
+- ✓ Simple Express server with JSON file storage (sessions, attempts, images)
+- ✓ Client-side Claude integration
 - ✓ Sandboxed iframe SketchRunner
 - ✓ Image upload & persistence
 - ✓ Basic loop orchestration
@@ -544,10 +622,11 @@ STYLE:
 ## Key Architectural Decisions
 
 1. **Client-orchestrated loop**: Keeps rendering in browser, simpler to implement
-2. **REST over WebSocket**: Fewer moving parts, client knows when iterations finish
-3. **SQLite + local files**: Fast persistence, minimal ops, easy migration
-4. **iframe sandbox**: Safest practical way to run untrusted code
-5. **WebP @ 512x512**: Good quality/size tradeoff for visual feedback
+2. **Client-side Claude calls**: Faster iteration, simpler server, acceptable for local-only prototype
+3. **REST over WebSocket**: Fewer moving parts, client knows when iterations finish
+4. **JSON files instead of database**: Human-readable, git-friendly, zero setup
+5. **Iframe sandbox**: Safest practical way to run untrusted code
+6. **WebP @ 512x512**: Good quality/size tradeoff for visual feedback
 
 ---
 
@@ -566,36 +645,44 @@ STYLE:
 
 1. **Initialize server**: 
    ```bash
-   cd server && npm init -y
-   npm install express cors multer @anthropic-ai/sdk
-   npm install -D typescript @types/node @types/express @types/cors @types/multer tsx
+   mkdir server && cd server && npm init -y
+   npm install express cors
+   npm install -D typescript @types/node @types/express @types/cors tsx
    ```
 
-2. **Initialize client**: 
+2. **Initialize client** (already done):
    ```bash
-   npm create vite@latest client -- --template react-ts
-   cd client && npm install p5
+   npm install p5 @anthropic-ai/sdk
+   npm install -D @types/p5
    ```
 
-3. **Create folder structure**: `mkdir -p data/sessions`
+3. **Add API key**:
+   ```bash
+   # .env (git-ignored)
+   echo "VITE_ANTHROPIC_KEY=sk-ant-your-key-here" > .env
+   ```
 
-4. **Create API endpoints**: Sessions, images, attempts, agent (just read/write JSON)
+4. **Create folder structure**: `mkdir -p data/sessions`
 
-5. **Implement SketchRunner**: Sandboxed iframe component
+5. **Create API endpoints**: Sessions, images, attempts (just read/write JSON - no AI logic)
 
-6. **Implement loop**: Generate → Render → Capture → Improve
+6. **Implement Claude service**: Client-side wrapper for API calls
 
-7. **Add UI**: HistoryList with auto-scroll, scoring/tagging
+7. **Implement SketchRunner**: Sandboxed iframe component
 
-8. **Test**: Start with "draw a circle" and iterate
+8. **Implement loop**: Claude call → Render → Capture → Save
 
-**Run**:
+9. **Add UI**: HistoryList with auto-scroll, scoring/tagging
+
+10. **Test**: Start with "draw a circle" and iterate
+
+**Run** (dev mode with hot-reload):
 ```bash
 # Terminal 1 (server)
 cd server && npx tsx src/server.ts
 
-# Terminal 2 (client)  
-cd client && npm run dev
+# Terminal 2 (Vue dev server with hot-reload)
+npm run dev
 ```
 
 ---
